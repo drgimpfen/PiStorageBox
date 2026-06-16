@@ -10,6 +10,7 @@ Diese Dokumentation beschreibt die Einrichtung eines performanten, wartungsarmen
 - [5. Firewall- & System-Absicherung (UFW & Fail2ban)](#5-firewall---system-absicherung-ufw--fail2ban)
 - [6. Das Immutability-Skript (WORM-Schutz)](#6-das-immutability-skript-worm-schutz)
 - [7. Client-Verbindung](#7-client-verbindung)
+- [8. Optional: Dateimanagement-User (Manager-Zugang)](#8-optional-dateimanagement-user-manager-zugang)
 
 ---
 
@@ -184,3 +185,47 @@ Der zu sichernde Client initialisiert das Repository nun völlig normal über de
 ```bash
 borg init --encryption=repokey borg@<dyndns-adresse>:50022/mnt/borgbackup/mein-backup
 ```
+
+---
+
+## 8. Optional: Dateimanagement-User (Manager-Zugang)
+
+Wenn ein interaktiver Zugriff benötigt wird, um Ordnerstrukturen anzulegen oder alte Archive manuell zu löschen (ohne Admin-Rechte zu nutzen), kann ein spezieller Management-User eingerichtet werden. Dieser nutzt Linux-Dateisystemrechte anstelle eines starren SSH-Gefängnisses.
+
+### User anlegen und berechtigen
+```bash
+# 1. User mit normaler Shell anlegen
+sudo adduser --shell /bin/bash borgmanager
+
+# 2. Zur borg-Gruppe hinzufügen, damit Schreibrechte bestehen
+sudo usermod -aG borg borgmanager
+
+# 3. Direktes Wechseln in den Backup-Ordner beim Login erzwingen
+echo "cd /mnt/borgbackup" | sudo tee -a /home/borgmanager/.bashrc
+```
+
+### SSH-Zugang einrichten
+```bash
+# Verzeichnisse als Manager-User anlegen
+sudo -u borgmanager mkdir -p /home/borgmanager/.ssh
+sudo -u borgmanager nano /home/borgmanager/.ssh/authorized_keys
+
+# => Hier den neuen Public Key einfügen. 
+# WICHTIG: KEIN command="..." davor setzen, da interaktiv gearbeitet wird!
+
+# Rechte restriktiv setzen
+sudo -u borgmanager chmod 700 /home/borgmanager/.ssh
+sudo -u borgmanager chmod 600 /home/borgmanager/.ssh/authorized_keys
+```
+
+### SSH-Dienst anpassen
+In der `/etc/ssh/sshd_config` muss der neue User der `AllowUsers`-Direktive hinzugefügt werden:
+```text
+AllowUsers adminpi borg borgmanager
+```
+Anschließend den Dienst neu starten: 
+```bash
+sudo systemctl restart ssh
+```
+
+**Ergebnis:** Beim Login via `ssh borgmanager@<lokale-ip>` landet man direkt im Pfad `/mnt/borgbackup`. Man kann dort völlig frei agieren (`ls`, `rm -rf`, `mkdir`), hat jedoch keinerlei `sudo`-Rechte. Das restliche Betriebssystem ist somit vor Fehlern oder Manipulation geschützt.
