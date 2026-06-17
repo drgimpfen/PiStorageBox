@@ -256,29 +256,12 @@ Im Router (z. B. FritzBox) muss eine Portweiterleitung für das Backup eingerich
 
 ### UFW-Firewall konfigurieren
 
-**Standard-Einstellung:**
+**Einfache Einstellung (Backup-Clients von außen erlaubt):**
 ```bash
 sudo apt update && sudo apt install ufw
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow 22/tcp
-sudo ufw enable
-```
-
-**Bessere Einstellung (nur RFC1918 + Backup-Traffic):**
-```bash
-sudo apt update && sudo apt install ufw
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-
-# SSH nur aus lokalem Netz erlauben
-sudo ufw allow from 192.168.0.0/16 to any port 22/tcp
-sudo ufw allow from 10.0.0.0/8 to any port 22/tcp
-sudo ufw allow from 172.16.0.0/12 to any port 22/tcp
-sudo ufw allow from 127.0.0.1 to any port 22/tcp
-sudo ufw allow from ::1 to any port 22/tcp comment 'IPv6 localhost'
-
-# Alle anderen Zugriffe auf Port 22 werden implizit abgelehnt
 sudo ufw enable
 ```
 
@@ -320,7 +303,7 @@ sudo fail2ban-client status sshd
 
 ## 6. Das Immutability-Skript (WORM-Schutz)
 
-Dieses Skript sichert den aktiven Bestand täglich in einen unantastbaren Snapshot.
+Dieses Skript sichert den aktiven Bestand täglich in einen unantastbaren Snapshot und löscht Snapshots, die älter als 10 Tage sind.
 
 ### 6.1 Sudoer-Konfiguration (KRITISCH!)
 
@@ -376,27 +359,34 @@ else
     exit 1
 fi
 
-# 2. Rotation: Behalte nur die neuesten 10 Snapshots
-# Sortiere nach Namen (chronologisch) und behalte die 10 neuesten
-SNAPSHOTS=$(ls -1d "$SNAPSHOT_DIR"/snap_* 2>/dev/null | sort -r)
-COUNT=$(echo "$SNAPSHOTS" | wc -l)
+# 2. Rotation: Lösche Snapshots älter als 10 Tage
+echo "[$(date)] === Snapshot-Rotation (>10 Tage) ===" >> "$LOG_FILE"
 
-if [ "$COUNT" -gt 10 ]; then
-    echo "[$(date)] Rotation: $COUNT Snapshots vorhanden, lösche $(($COUNT - 10)) ältere" >> "$LOG_FILE"
-    # Wichtig: Verwende process substitution, nicht pipe, um Variable-Scope zu erhalten
-    while IFS= read -r old_snap; do
-        if btrfs subvolume delete "$old_snap" 2>> "$LOG_FILE"; then
-            echo "[$(date)] ✓ Gelöscht: $(basename "$old_snap")" >> "$LOG_FILE"
-        else
-            echo "[$(date)] ✗ Fehler beim Löschen: $(basename "$old_snap")" >> "$LOG_FILE"
-        fi
-    done < <(echo "$SNAPSHOTS" | tail -n +11)
+# Find-Befehl: Finde alle snap_* älter als 10 Tage
+# -mtime +10 = modifiziert vor mehr als 10 Tagen
+OLD_SNAPSHOTS=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name "snap_*" -type d -mtime +10 2>/dev/null)
+
+if [ -z "$OLD_SNAPSHOTS" ]; then
+    echo "[$(date)] Info: Keine Snapshots älter als 10 Tage gefunden" >> "$LOG_FILE"
 else
-    echo "[$(date)] Info: Nur $COUNT Snapshots, keine Rotation nötig" >> "$LOG_FILE"
+    COUNT=$(echo "$OLD_SNAPSHOTS" | wc -l)
+    echo "[$(date)] Rotation: $COUNT Snapshots älter als 10 Tage, lösche diese..." >> "$LOG_FILE"
+    
+    while IFS= read -r old_snap; do
+        if [ -n "$old_snap" ]; then
+            if btrfs subvolume delete "$old_snap" 2>> "$LOG_FILE"; then
+                echo "[$(date)] ✓ Gelöscht: $(basename "$old_snap")" >> "$LOG_FILE"
+            else
+                echo "[$(date)] ✗ Fehler beim Löschen: $(basename "$old_snap")" >> "$LOG_FILE"
+            fi
+        fi
+    done <<< "$OLD_SNAPSHOTS"
 fi
 
 echo "[$(date)] === Snapshot-Erstellung abgeschlossen ===" >> "$LOG_FILE"
 ```
+
+**Wichtig:** Das Skript löscht jetzt Snapshots, die älter als 10 Tage sind (basierend auf Änderungszeit), nicht die ältesten 10 Snapshots!
 
 ### 6.3 Skript ausführbar machen und in Root-Cron einfügen
 
@@ -436,6 +426,18 @@ sudo btrfs subvolume list /mnt/borg-snapshots
 
 # Oder detaillierter:
 ls -lh /mnt/borg-snapshots/ | grep snap_
+```
+
+**Snapshot-Alter prüfen:**
+```bash
+# Zeigt Änderungszeit der Snapshots
+find /mnt/borg-snapshots -name "snap_*" -type d -exec stat -c "%y %n" {} \;
+
+# Beispielausgabe:
+# 2026-06-07 03:00:45.234567890 +0200 /mnt/borg-snapshots/snap_2026-06-07_03-00-45
+# 2026-06-06 03:00:22.123456789 +0200 /mnt/borg-snapshots/snap_2026-06-06_03-00-22
+# ...
+# (Snapshots älter als 10 Tage werden automatisch gelöscht)
 ```
 
 ---
@@ -593,16 +595,17 @@ du -sh /mnt/borgbackup/*/
 - [ ] SSH-Härtung (PasswordAuth no, PermitRootLogin no, MaxAuthTries 3)
 - [ ] Admin-Lockdown mit `Address *,!RFC1918` konfiguriert
 - [ ] SSH-Tests durchgeführt (lokal ✅, extern ❌)
-- [ ] Firewall aktiviert (UFW) mit RFC1918-Beschränkung oder Allow-all
+- [ ] Firewall aktiviert (UFW) mit Allow-all auf Port 22
 - [ ] Fail2ban installiert und aktiv
 - [ ] Router-Portweiterleitung konfiguriert (Port 50022 → 22)
 
 **Snapshots & Automation:**
 - [ ] Sudoer-Regel für BTRFS erstellt (`/etc/sudoers.d/borg-snapshot`)
-- [ ] Snapshot-Skript erstellt und getestet
+- [ ] Snapshot-Skript erstellt und getestet (10-Tage-Retention)
 - [ ] Snapshot-Skript in root-Crontab eingeplant
 - [ ] Manuelle Snapshot-Erstellung getestet (`sudo /usr/local/bin/borg-snapshot.sh`)
 - [ ] Logfile überprüft (`/var/log/borg-snapshot.log`)
+- [ ] Snapshot-Alter prüfen: `find /mnt/borg-snapshots -name "snap_*" -exec stat -c "%y %n" {} \;`
 
 **Verwaltung:**
 - [ ] Manager-User optional konfiguriert (oder übersprungen)
