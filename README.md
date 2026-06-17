@@ -25,7 +25,7 @@ Ein lokaler Cronjob friert den Backup-Zustand täglich in schreibgeschützten (R
 2. **Pfad-Restriktion:** SSH-Keys mit `borg serve --restrict-to-path` binden Zugriff an Verzeichnis
 3. **WORM-Snapshots:** Tägliche Read-Only Snapshots, nicht durch Clients löschbar
 4. **Quota-Limits:** Verhindert Disk-DoS durch kompromittierte Clients
-5. **SSH-Härtung:** Passwortlos, Admin auf RFC1918 beschränkt, Firewall mit Fail2ban
+5. **SSH-Härtung:** Passwortlos, Admin (adminpi) auf RFC1918 beschränkt, Fail2ban gegen Brute-Force
 
 ---
 
@@ -137,8 +137,8 @@ sudo btrfs qgroup show /mnt/borgbackup
 ```
 
 **Was bedeutet die Ausgabe?**
-- `rfer`: Referenced (echte Datenmenge, inklusive Snapshots)
-- `excl`: Exclusive (nur in diesem Subvolume, nicht in Snapshots)
+- `rfer`: Referenced - Datenmenge in diesem Subvolume (Snapshots sind separate Subvolumes)
+- `excl`: Exclusive - nur in diesem Subvolume, nicht in Snapshots
 - `max_rfer`: Dein Limit (800 GiB in diesem Fall)
 
 ### 2.5 Freien Platz überwachen (optional)
@@ -160,13 +160,14 @@ sudo btrfs filesystem usage /mnt/borgbackup
 Für eine saubere Skalierbarkeit nutzen wir eine generische Gruppe und isolierte Unterordner für jeden User. Wir verwenden beispielhaft den User `borg12345678`.
 
 ### 3.1 Generische Gruppe & isolierten User anlegen
+
 ```bash
 # 1. Generische Backup-Gruppe erstellen
 sudo addgroup borg
 
-# 2. Backup-User anlegen mit Login-Shell DEAKTIVIERT
-# (verhindert SSH-Shell-Zugriff, nur SSH-Kommandos erlaubt)
-sudo adduser --system --ingroup borg --shell /usr/sbin/nologin borg12345678
+# 2. Backup-User anlegen MIT Home-Verzeichnis
+# (shell /usr/sbin/nologin verhindert SSH-Shell-Zugriff, nur SSH-Kommandos erlaubt)
+sudo adduser --ingroup borg --shell /usr/sbin/nologin --disabled-password borg12345678
 
 # 3. Dedizierten Unterordner für dieses Gerät anlegen
 sudo mkdir -p /mnt/borgbackup/borg12345678
@@ -174,10 +175,16 @@ sudo chown borg12345678:borg /mnt/borgbackup/borg12345678
 sudo chmod 700 /mnt/borgbackup/borg12345678
 ```
 
-**Warum `--shell /usr/sbin/nologin` statt `/bin/bash`?**
-- ✅ Verhindert direkte Shell-Nutzung (nur `command=` SSH-Befehle erlaubt)
+**Wichtig:** 
+- `--ingroup borg`: User ist in der Borg-Gruppe
+- `--shell /usr/sbin/nologin`: Verhindert direkte Shell-Nutzung (nur `command=` SSH-Befehle erlaubt)
+- `--disabled-password`: Passwort-Login unmöglich (nur Key-Auth)
+- **Home-Verzeichnis wird automatisch unter `/home/borg12345678` erstellt** (notwendig für `.ssh/authorized_keys`)
+
+**Warum nologin statt bash?**
+- ✅ Verhindert direkte Shell-Nutzung
 - ✅ Sicherer gegen SSH-Escape-Versuche durch kompromittierte Clients
-- ✅ Standard-Best-Practice für System-User
+- ✅ Standard-Best-Practice für System-User mit eingeschränktem SSH-Zugriff
 
 ### 3.2 SSH-Keys hinterlegen (Strikte Pfad-Bindung)
 Der öffentliche SSH-Schlüssel des Clients wird in der `~/.ssh/authorized_keys` des Backup-Users hinterlegt. Der Zugriff wird zwingend auf den eigenen Unterordner limitiert!
@@ -201,7 +208,7 @@ sudo -u borg12345678 chmod 600 /home/borg12345678/.ssh/authorized_keys
 
 ## 4. SSH-Härtung & Netzwerk-Trennung
 
-In der `/etc/ssh/sshd_config` wird der passwortlose Login erzwungen. Der Admin-Zugang wird auf das Heimnetzwerk (RFC 1918) beschränkt, um Manipulationen am Betriebssystem aus dem Internet auszuschließen.
+In der `/etc/ssh/sshd_config` wird der passwortlose Login erzwungen. Der Admin-Zugang (`adminpi`) wird auf das Heimnetzwerk (RFC 1918) beschränkt, um Manipulationen am Betriebssystem aus dem Internet auszuschließen. Backup-Clients (`borg*`) dürfen von überall zugreifen.
 
 ```text
 # Globale Einstellungen
@@ -215,6 +222,7 @@ MaxSessions 5
 AllowUsers adminpi borg12345678
 
 # Admin-Lockdown: Sperren für alle Adressen außer RFC1918 (lokales Netz)
+# Backup-Clients sind NICHT betroffen - diese dürfen von überall zugreifen
 Match User adminpi Address *,!192.168.0.0/16,!10.0.0.0/8,!172.16.0.0/12,!127.0.0.1,!::1
     DenyUsers adminpi
 ```
@@ -224,9 +232,11 @@ Match User adminpi Address *,!192.168.0.0/16,!10.0.0.0/8,!172.16.0.0/12,!127.0.0
 - `PermitRootLogin no`: Root-Login unmöglich
 - `MaxAuthTries 3`: Verhindert Brute-Force (nach 3 Versuchen: Verbindung getrennt)
 - `MaxSessions 5`: Maximale gleichzeitige Sessions pro User
-- `Match User adminpi Address *,!RFC1918`: Admin nur aus lokalem Netz
+- `AllowUsers adminpi borg12345678`: Nur diese zwei User dürfen sich verbinden
+- `Match User adminpi Address *,!RFC1918`: **NUR adminpi** wird auf RFC1918 beschränkt
   - `*,!X,!Y,!Z` = "Alle Adressen AUSSER X, Y, Z"
   - Trifft zu für Zugriffe von extern → `DenyUsers adminpi` wird angewendet
+  - **borg12345678 ist NICHT betroffen** - hat keine Match-Regel!
 
 Nach der Änderung den Dienst neu starten:
 ```bash
@@ -235,15 +245,16 @@ sudo systemctl restart ssh
 
 **Tests vor der Aktivierung durchführen (WICHTIG!):**
 ```bash
-# Test 1: Lokales SSH sollte funktionieren
+# Test 1: Lokales adminpi-SSH sollte funktionieren
 ssh adminpi@localhost
 
-# Test 2: Von extern sollte nicht funktionieren
+# Test 2: adminpi von extern sollte nicht funktionieren
 ssh -p 50022 adminpi@<deine-dyndns-adresse>
 # Erwartet: "Permission denied" oder "Broken pipe"
 
-# Test 3: Backup-Clients sollten funktionieren
+# Test 3: Backup-Clients sollten von überall funktionieren (KEINE Beschränkung!)
 ssh -p 50022 borg12345678@<deine-dyndns-adresse> "borg serve --version"
+# Erwartet: Erfolg, egal von welcher IP
 ```
 
 ---
@@ -472,11 +483,10 @@ sudo adduser --shell /usr/bin/lshell manager87654321
 Der Manager braucht Schreibzugriff auf **alle** Borg-User-Verzeichnisse. Dies wird mit ACLs gelöst:
 
 ```bash
-# Manager in die generische Backup-Gruppe aufnehmen
+# Manager in die Borg-Gruppe aufnehmen (für Future-Proofing)
 sudo usermod -aG borg manager87654321
 
-# ACL-Regel: Der Manager erhält rwx-Rechte auf alle zukünftigen Dateien/Ordner
-# (dies löst auch Umask-Probleme)
+# ACL-Regel: Der Manager (User) erhält rwx-Rechte auf alle zukünftigen Dateien/Ordner
 sudo setfacl -R -d -m u:manager87654321:rwx /mnt/borgbackup
 
 # Rückwirkend: Manager erhält auch auf bereits existierende Verzeichnisse Zugriff
@@ -531,7 +541,7 @@ sftp            = 0
 - ✅ Alte Archive löschen (`rm -r /mnt/borgbackup/borg12345678/archive-name`)
 - ✅ Leere Verzeichnisse entfernen (`rmdir`)
 - ❌ Snapshots NICHT sehen/löschen (liegen unter `/mnt/borg-snapshots`, nicht erreichbar)
-- ❌ Einzelne Clients können nicht untereinander Repos zugreifen (ACL nur auf `/mnt/borgbackup`)
+- ❌ Backup-Clients können nicht untereinander auf Repos zugreifen (SSH-Kommando + `--restrict-to-path` erzwingt Isolation)
 
 ### 8.5 SSH-Zugriff & Tunnel-Sperre konfigurieren
 
@@ -560,10 +570,10 @@ sudo systemctl restart ssh
 
 **Test:**
 ```bash
-# Lokaler Test
+# Lokal (über localhost, Port 22):
 ssh -p 22 manager87654321@localhost
 
-# Remote Test
+# Remote (über Port-Forwarding, Port 50022):
 ssh -p 50022 manager87654321@<dyndns-adresse>
 # Sollte im Terminal-Stammverzeichnis /mnt/borgbackup landen
 
@@ -586,15 +596,16 @@ du -sh /mnt/borgbackup/*/
 
 **Benutzer & Isolation:**
 - [ ] Generische `borg` Gruppe erstellt
-- [ ] Jeder Borg-User mit `--shell /usr/sbin/nologin` (nicht `/bin/bash`!)
+- [ ] Jeder Borg-User mit `--shell /usr/sbin/nologin` und Home-Verzeichnis
 - [ ] Jeder Borg-User hat Verzeichnis mit `chmod 700`
 - [ ] SSH-Keys mit `command=` und `--restrict-to-path` konfiguriert
 - [ ] ACLs für Manager konfiguriert (falls verwendet)
 
 **SSH & Netzwerk:**
 - [ ] SSH-Härtung (PasswordAuth no, PermitRootLogin no, MaxAuthTries 3)
-- [ ] Admin-Lockdown mit `Address *,!RFC1918` konfiguriert
-- [ ] SSH-Tests durchgeführt (lokal ✅, extern ❌)
+- [ ] Admin-Lockdown (`adminpi`) mit `Address *,!RFC1918` konfiguriert
+- [ ] Backup-Clients (`borg*`) haben KEINE Beschränkung
+- [ ] SSH-Tests durchgeführt (adminpi lokal ✅, extern ❌; borg extern ✅)
 - [ ] Firewall aktiviert (UFW) mit Allow-all auf Port 22
 - [ ] Fail2ban installiert und aktiv
 - [ ] Router-Portweiterleitung konfiguriert (Port 50022 → 22)
