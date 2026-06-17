@@ -1,5 +1,4 @@
 # Hochsicheres BorgBackup-Ziel auf Raspberry Pi (WORM & BTRFS)
-
 Diese Dokumentation beschreibt die Einrichtung eines performanten, wartungsarmen und gegen Ransomware gehärteten Backup-Servers auf Basis eines Raspberry Pi. Das System ist aus dem Internet für Backup-Clients erreichbar, aber maximal gehärtet gegen Kompromittierung.
 
 ## Inhaltsverzeichnis
@@ -15,9 +14,7 @@ Diese Dokumentation beschreibt die Einrichtung eines performanten, wartungsarmen
 ---
 
 ## 1. Architektur-Übersicht
-
 Das System nutzt eine NVMe-SSD, die mit BTRFS formatiert ist. Die Backup-Clients sichern über weitergeleitete Ports in isolierte Unterordner.
-
 Ein lokaler Cronjob friert den Backup-Zustand täglich in schreibgeschützten (Read-Only) Snapshots ein (10 Tage Retention). Dies schützt vor Löschung durch kompromittierte Clients (Ransomware).
 
 **Sicherheits-Schichten:**
@@ -25,17 +22,16 @@ Ein lokaler Cronjob friert den Backup-Zustand täglich in schreibgeschützten (R
 2. **Pfad-Restriktion:** SSH-Keys mit `borg serve --restrict-to-path` binden Zugriff an Verzeichnis
 3. **WORM-Snapshots:** Tägliche Read-Only Snapshots, nicht durch Clients löschbar
 4. **Quota-Limits:** Verhindert Disk-DoS durch kompromittierte Clients
-5. **SSH-Härtung:** Passwortlos, Admin (adminpi) auf RFC1918 beschränkt, Fail2ban gegen Brute-Force
+5. **SSH-Härtung:** Passwortlos, Admin (`adminpi`) auf RFC1918 beschränkt, Fail2ban gegen Brute-Force
 
 ---
 
 ## 2. Speicher-Einrichtung (BTRFS & Quotas)
-
 Die NVMe (hier beispielhaft `/dev/nvme0n1`) wird formatiert und in ein aktives Backup-Subvolume sowie ein separates Snapshot-Subvolume unterteilt.
 
 **Warum zwei Subvolumes?**
-- **`borg-aktiv`**: Empfängt aktive Backup-Schreibvorgänge. Hat ein hartes Quota-Limit (verhindert DoS durch volle Disk).
-- **`borg-snapshots`**: Speichert nur Read-Only Snapshots. Geschützt vor Änderungen durch Backup-Clients, da sie über `--restrict-to-path` nicht sichtbar sind.
+- `borg-aktiv`: Empfängt aktive Backup-Schreibvorgänge. Hat ein hartes Quota-Limit (verhindert DoS durch volle Disk).
+- `borg-snapshots`: Speichert nur Read-Only Snapshots. Geschützt vor Änderungen durch Backup-Clients, da sie über `--restrict-to-path` nicht sichtbar sind.
 
 ### 2.1 BTRFS-Tools installieren & formatieren
 ```bash
@@ -57,12 +53,10 @@ sudo umount /mnt
 - ✅ Getrennte Verwaltung (Snapshots können gelöscht werden, ohne aktive Backups zu beeinflussen)
 
 ### 2.3 Dauerhafter Mount via `/etc/fstab`
-
 Ermittle die UUID deiner NVMe:
 ```bash
 sudo blkid /dev/nvme0n1
 ```
-
 Beispielausgabe:
 ```
 /dev/nvme0n1: UUID="12345678-1234-1234-1234-123456789abc" TYPE="btrfs"
@@ -78,7 +72,7 @@ UUID=12345678-1234-1234-1234-123456789abc /mnt/borg-snapshots btrfs subvol=borg-
 - `subvol=borg-aktiv` / `subvol=borg-snapshots`: Mounte nur das spezifische Subvolume
 - `defaults`: Standard-Optionen (rw, relatime, etc.)
 - `noatime`: Keine Access-Time-Updates → weniger Writes, bessere Performance
-- `nodatacow`: (nur für aktiv) Deaktiviert Copy-on-Write → bessere Backup-Performance (Snapshots trotzdem möglich)
+- `nodatacow`: (Nur für `borg-aktiv`) Deaktiviert Copy-on-Write → bessere Backup-Performance. **Hinweis:** Dies deaktiviert auch BTRFS-eigene Prüfsummen. Da Borg jedoch seine eigenen kryptografischen Prüfsummen mitbringt, ist der Performance-Gewinn hier legitim.
 
 Danach Verzeichnisse erstellen und mounten:
 ```bash
@@ -91,7 +85,6 @@ sudo mount -a
 mount | grep borgbackup
 mount | grep borg-snapshots
 ```
-
 Erwartet:
 ```
 .../dev/nvme0n1 on /mnt/borgbackup type btrfs (...)
@@ -99,13 +92,12 @@ Erwartet:
 ```
 
 ### 2.4 BTRFS-Quotas aktivieren (Anti-Überfüllungs-Schutz)
-
 **Warum Quotas?** Ein kompromittierter Client könnte die SSD absichtlich zu 100 % füllen. Das würde:
 - ❌ Das Löschen von Snapshots blockieren (nicht genug freier Platz)
 - ❌ Andere Clients blockieren (keine Schreibvorgänge mehr möglich)
 - ❌ Das System in einen nicht-wartbaren Zustand versetzen
 
-Mit Quotas wird der Client bei Erreichen des Limits abgeblockt, **bevor** die Disk voll wird.
+> ⚠️ **Warnung für Raspberry Pi:** BTRFS-Quotas (qgroups) sind resourcenintensiv. Auf schwacher Hardware (wie einem Pi) können sie bei vielen Dateien das System ausbremsen. Behalte die Systemlast im Blick!
 
 Quota-System aktivieren (nur auf aktives Subvolume!):
 ```bash
@@ -125,48 +117,35 @@ Reserviert für Snapshots: ~200 GB (10 Snapshots à ~20 GB)
 Verfügbar für aktive Backups: ~800 GB ← Setze diesen Wert hier ein
 ```
 
-Überprüfe die korrekte Konfiguration:
+Überprüfe die Konfiguration:
 ```bash
-# Zeigt aktuelle Quotas und Belegung
 sudo btrfs qgroup show /mnt/borgbackup
-
 # Beispielausgabe:
 # qgroupid         rfer         excl     max_rfer
 # --------         ----         ----     --------
 # 0/5          1.00GiB      500.00MiB     800.00GiB
 ```
 
-**Was bedeutet die Ausgabe?**
-- `rfer`: Referenced - Datenmenge in diesem Subvolume (Snapshots sind separate Subvolumes)
-- `excl`: Exclusive - nur in diesem Subvolume, nicht in Snapshots
-- `max_rfer`: Dein Limit (800 GiB in diesem Fall)
-
 ### 2.5 Freien Platz überwachen (optional)
-
-Zum täglichen Überwachen der Disk-Belegung (z. B. in Crontab):
+Zum täglichen Überwachen der Disk-Belegung:
 ```bash
 df -h /mnt/borgbackup /mnt/borg-snapshots
-```
-
-Oder auf Quota-Basis (aussagekräftiger):
-```bash
+# Oder aussagekräftiger:
 sudo btrfs filesystem usage /mnt/borgbackup
 ```
 
 ---
 
 ## 3. Gruppen, Benutzer & Client-Isolation
-
 Für eine saubere Skalierbarkeit nutzen wir eine generische Gruppe und isolierte Unterordner für jeden User. Wir verwenden beispielhaft den User `borg12345678`.
 
 ### 3.1 Generische Gruppe & isolierten User anlegen
-
 ```bash
 # 1. Generische Backup-Gruppe erstellen
 sudo addgroup borg
 
 # 2. Backup-User anlegen MIT Home-Verzeichnis
-# (shell /usr/sbin/nologin verhindert SSH-Shell-Zugriff, nur SSH-Kommandos erlaubt)
+# (shell /usr/sbin/nologin verhindert interaktive Shell-Sessions)
 sudo adduser --ingroup borg --shell /usr/sbin/nologin --disabled-password borg12345678
 
 # 3. Dedizierten Unterordner für dieses Gerät anlegen
@@ -175,40 +154,38 @@ sudo chown borg12345678:borg /mnt/borgbackup/borg12345678
 sudo chmod 700 /mnt/borgbackup/borg12345678
 ```
 
-**Wichtig:** 
-- `--ingroup borg`: User ist in der Borg-Gruppe
+**Wichtig:**
+- `--ingroup borg`: User ist in der Borg-Gruppe (wichtig für den Manager-User später)
 - `--shell /usr/sbin/nologin`: Verhindert direkte Shell-Nutzung (nur `command=` SSH-Befehle erlaubt)
 - `--disabled-password`: Passwort-Login unmöglich (nur Key-Auth)
-- **Home-Verzeichnis wird automatisch unter `/home/borg12345678` erstellt** (notwendig für `.ssh/authorized_keys`)
-
-**Warum nologin statt bash?**
-- ✅ Verhindert direkte Shell-Nutzung
-- ✅ Sicherer gegen SSH-Escape-Versuche durch kompromittierte Clients
-- ✅ Standard-Best-Practice für System-User mit eingeschränktem SSH-Zugriff
 
 ### 3.2 SSH-Keys hinterlegen (Strikte Pfad-Bindung)
-Der öffentliche SSH-Schlüssel des Clients wird in der `~/.ssh/authorized_keys` des Backup-Users hinterlegt. Der Zugriff wird zwingend auf den eigenen Unterordner limitiert!
+Der öffentliche SSH-Schlüssel des Clients wird hinterlegt. Der Zugriff wird zwingend auf den eigenen Unterordner limitiert!
 
 ```bash
 sudo -u borg12345678 mkdir -p /home/borg12345678/.ssh
 sudo -u borg12345678 nano /home/borg12345678/.ssh/authorized_keys
 ```
+
+Folgenden Eintrag setzen (alles in einer Zeile!):
 ```text
-# Eintrag (alles in einer Zeile!):
-command="borg serve --restrict-to-path /mnt/borgbackup/borg12345678",restrict ssh-ed25519 AAAAC3N...[CLIENT_KEY]
+command="borg serve --restrict-to-path /mnt/borgbackup/borg12345678 --umask=0007",restrict ssh-ed25519 AAAAC3N...[CLIENT_KEY]
 ```
+
 ```bash
 sudo -u borg12345678 chmod 700 /home/borg12345678/.ssh
 sudo -u borg12345678 chmod 600 /home/borg12345678/.ssh/authorized_keys
 ```
 
-**Für jedes weitere User:** Neuen User erstellen, neuen Unterordner anlegen und den `--restrict-to-path` in der jeweiligen authorized_keys auf den neuen Unterordner zeigen lassen.
+**Erklärung der Borg-Parameter:**
+- `--restrict-to-path`: Zwingt Borg, nur in diesem Verzeichnis zu arbeiten.
+- `--umask=0007`: **Kritisch!** Borg erstellt Dateien sonst mit `0600` (nur für den Besitzer). Wenn später ein Manager-User (über die Gruppe `borg`) alte Archive aufräumen soll, braucht die Gruppe Leserechte. `0007` sorgt dafür, dass Dateien mit `660` und Ordner mit `770` erstellt werden.
+- `restrict` (SSH-Option): Deaktiviert Port-Forwarding und SFTP komplett.
 
 ---
 
 ## 4. SSH-Härtung & Netzwerk-Trennung
-
-In der `/etc/ssh/sshd_config` wird der passwortlose Login erzwungen. Der Admin-Zugang (`adminpi`) wird auf das Heimnetzwerk (RFC 1918) beschränkt, um Manipulationen am Betriebssystem aus dem Internet auszuschließen. Backup-Clients (`borg*`) dürfen von überall zugreifen.
+In der `/etc/ssh/sshd_config` wird der passwortlose Login erzwungen. Der Admin-Zugang (`adminpi`) wird auf das Heimnetzwerk (RFC 1918) beschränkt, um Manipulationen aus dem Internet auszuschließen. Backup-Clients (`borg*`) dürfen von überall zugreifen.
 
 ```text
 # Globale Einstellungen
@@ -218,7 +195,7 @@ PermitRootLogin no
 MaxAuthTries 3
 MaxSessions 5
 
-# Nur definierte Kern-User freigeben (Manager-User wird bei Bedarf in Schritt 8 ergänzt)
+# Nur definierte User freigeben (Manager wird in Schritt 8 ergänzt)
 AllowUsers adminpi borg12345678
 
 # Admin-Lockdown: Sperren für alle Adressen außer RFC1918 (lokales Netz)
@@ -230,13 +207,8 @@ Match User adminpi Address *,!192.168.0.0/16,!10.0.0.0/8,!172.16.0.0/12,!127.0.0
 **Logik der SSH-Härtung:**
 - `PasswordAuthentication no`: Nur Schlüsselbasierte Authentifizierung
 - `PermitRootLogin no`: Root-Login unmöglich
-- `MaxAuthTries 3`: Verhindert Brute-Force (nach 3 Versuchen: Verbindung getrennt)
-- `MaxSessions 5`: Maximale gleichzeitige Sessions pro User
-- `AllowUsers adminpi borg12345678`: Nur diese zwei User dürfen sich verbinden
-- `Match User adminpi Address *,!RFC1918`: **NUR adminpi** wird auf RFC1918 beschränkt
-  - `*,!X,!Y,!Z` = "Alle Adressen AUSSER X, Y, Z"
-  - Trifft zu für Zugriffe von extern → `DenyUsers adminpi` wird angewendet
-  - **borg12345678 ist NICHT betroffen** - hat keine Match-Regel!
+- `MaxAuthTries 3`: Verhindert Brute-Force
+- `Match User adminpi...`: **NUR adminpi** wird auf RFC1918 beschränkt. `borg12345678` hat keine Match-Regel und darf von überall zugreifen.
 
 Nach der Änderung den Dienst neu starten:
 ```bash
@@ -250,9 +222,9 @@ ssh adminpi@localhost
 
 # Test 2: adminpi von extern sollte nicht funktionieren
 ssh -p 50022 adminpi@<deine-dyndns-adresse>
-# Erwartet: "Permission denied" oder "Broken pipe"
+# Erwartet: "Permission denied" oder Verbindungsaufbau abgelehnt
 
-# Test 3: Backup-Clients sollten von überall funktionieren (KEINE Beschränkung!)
+# Test 3: Backup-Clients sollten von überall funktionieren
 ssh -p 50022 borg12345678@<deine-dyndns-adresse> "borg serve --version"
 # Erwartet: Erfolg, egal von welcher IP
 ```
@@ -266,8 +238,6 @@ Im Router (z. B. FritzBox) muss eine Portweiterleitung für das Backup eingerich
 * **Borg-Backup & Manager (SSH):** Externer Port `50022` (TCP) -> Interner Port `22` (TCP)
 
 ### UFW-Firewall konfigurieren
-
-**Einfache Einstellung (Backup-Clients von außen erlaubt):**
 ```bash
 sudo apt update && sudo apt install ufw
 sudo ufw default deny incoming
@@ -276,13 +246,7 @@ sudo ufw allow 22/tcp
 sudo ufw enable
 ```
 
-Status überprüfen:
-```bash
-sudo ufw status verbose
-```
-
 ### Intrusion Prevention mit Fail2ban
-
 Installation:
 ```bash
 sudo apt install fail2ban
@@ -313,32 +277,12 @@ sudo fail2ban-client status sshd
 ---
 
 ## 6. Das Immutability-Skript (WORM-Schutz)
-
 Dieses Skript sichert den aktiven Bestand täglich in einen unantastbaren Snapshot und löscht Snapshots, die älter als 10 Tage sind.
 
-### 6.1 Sudoer-Konfiguration (KRITISCH!)
-
-Damit das Skript BTRFS-Befehle ohne Passwort-Prompt ausführen kann, muss eine Sudoer-Regel erstellt werden:
-
-```bash
-sudo visudo -f /etc/sudoers.d/borg-snapshot
-```
-
-Folgende Zeilen einfügen:
-```text
-# Allow root cron to run btrfs commands without password
-Defaults:root !requiretty
-root ALL=(ALL) NOPASSWD: /usr/bin/btrfs
-```
-
-Speichern (`Ctrl+X`, `Y`, `Enter`).
-
-**Wichtig:** `visudo` validiert die Syntax automatisch. Fehler werden abgelehnt!
-
-### 6.2 Snapshot-Skript erstellen
+### 6.1 Snapshot-Skript erstellen
+Da das Skript via Root-Cron läuft, benötigt es keine `sudo`-Befehle im Code selbst.
 
 **Datei erstellen:** `/usr/local/bin/borg-snapshot.sh`
-
 ```bash
 #!/bin/bash
 set -e
@@ -348,13 +292,14 @@ trap 'echo "ERROR: Snapshot-Rotation fehlgeschlagen!" >&2' ERR
 
 # Ablageort für die Snapshots (Snapshot-Subvolume)
 SNAPSHOT_DIR="/mnt/borg-snapshots"
+
 # Das zu sichernde aktive Subvolume
 AKTIV_DIR="/mnt/borgbackup"
 
-# Eindeutige Timestamp mit Sekunden (verhindert Duplikate)
+# Eindeutiger Timestamp mit Sekunden (verhindert Duplikate)
 DATE=$(date +%Y-%m-%d_%H-%M-%S)
 
-# Log-Datei mit korrekten Berechtigungen
+# Log-Datei
 LOG_FILE="/var/log/borg-snapshot.log"
 
 # Stelle sicher, dass Logfile beschreibbar ist
@@ -373,8 +318,6 @@ fi
 # 2. Rotation: Lösche Snapshots älter als 10 Tage
 echo "[$(date)] === Snapshot-Rotation (>10 Tage) ===" >> "$LOG_FILE"
 
-# Find-Befehl: Finde alle snap_* älter als 10 Tage
-# -mtime +10 = modifiziert vor mehr als 10 Tagen
 OLD_SNAPSHOTS=$(find "$SNAPSHOT_DIR" -maxdepth 1 -name "snap_*" -type d -mtime +10 2>/dev/null)
 
 if [ -z "$OLD_SNAPSHOTS" ]; then
@@ -382,7 +325,7 @@ if [ -z "$OLD_SNAPSHOTS" ]; then
 else
     COUNT=$(echo "$OLD_SNAPSHOTS" | wc -l)
     echo "[$(date)] Rotation: $COUNT Snapshots älter als 10 Tage, lösche diese..." >> "$LOG_FILE"
-    
+
     while IFS= read -r old_snap; do
         if [ -n "$old_snap" ]; then
             if btrfs subvolume delete "$old_snap" 2>> "$LOG_FILE"; then
@@ -397,15 +340,12 @@ fi
 echo "[$(date)] === Snapshot-Erstellung abgeschlossen ===" >> "$LOG_FILE"
 ```
 
-**Wichtig:** Das Skript löscht jetzt Snapshots, die älter als 10 Tage sind (basierend auf Änderungszeit), nicht die ältesten 10 Snapshots!
-
-### 6.3 Skript ausführbar machen und in Root-Cron einfügen
-
+### 6.2 Skript ausführbar machen und in Root-Cron einfügen
 ```bash
 sudo chmod +x /usr/local/bin/borg-snapshot.sh
 
-# Crontab als root editieren (NICHT als sudo crontab -e!)
-sudo -i crontab -e
+# Crontab als root editieren
+sudo crontab -e
 ```
 
 Folgende Zeile einfügen:
@@ -413,64 +353,34 @@ Folgende Zeile einfügen:
 0 3 * * * /usr/local/bin/borg-snapshot.sh 2>&1
 ```
 
-Das heißt:
-- `0 3`: Jeden Tag um 03:00 Uhr
-- `/usr/local/bin/borg-snapshot.sh`: Führe Skript aus
-- `2>&1`: Leite auch Fehler ins Protokoll
-
-**Cron-Jobs als root überprüfen:**
-```bash
-sudo crontab -l
-```
-
 **Manueller Test:**
 ```bash
 sudo /usr/local/bin/borg-snapshot.sh
-
-# Logs prüfen
 tail -20 /var/log/borg-snapshot.log
-```
-
-**Snapshots auflisten:**
-```bash
-sudo btrfs subvolume list /mnt/borg-snapshots
-
-# Oder detaillierter:
-ls -lh /mnt/borg-snapshots/ | grep snap_
-```
-
-**Snapshot-Alter prüfen:**
-```bash
-# Zeigt Änderungszeit der Snapshots
-find /mnt/borg-snapshots -name "snap_*" -type d -exec stat -c "%y %n" {} \;
-
-# Beispielausgabe:
-# 2026-06-07 03:00:45.234567890 +0200 /mnt/borg-snapshots/snap_2026-06-07_03-00-45
-# 2026-06-06 03:00:22.123456789 +0200 /mnt/borg-snapshots/snap_2026-06-06_03-00-22
-# ...
-# (Snapshots älter als 10 Tage werden automatisch gelöscht)
 ```
 
 ---
 
 ## 7. Client-Verbindung
+Der zu sichernde Client initialisiert das Repository im zugewiesenen Unterordner.
 
-Der zu sichernde Client initialisiert das Repository nun im zugewiesenen Unterordner:
+**Achtung:** Borg benötigt zwingend die `ssh://`-Syntax, wenn ein Port (wie 50022) angegeben wird. Die SCP-Syntax (`user@host:port/...`) funktioniert hier nicht!
 
 ```bash
-borg init --encryption=repokey borg12345678@<dyndns-adresse>:50022/mnt/borgbackup/borg12345678/mein-backup
+borg init --encryption=repokey ssh://borg12345678@<dyndns-adresse>:50022/mnt/borgbackup/borg12345678/mein-backup
 ```
 
-**Beispiel mit lokaler IP:**
+**Beispiel mit lokaler IP (Standard-Port 22):**
 ```bash
-borg init --encryption=repokey borg12345678@192.168.1.100:22/mnt/borgbackup/borg12345678/mein-backup
+borg init --encryption=repokey borg12345678@192.168.1.100:/mnt/borgbackup/borg12345678/mein-backup
 ```
 
 ---
 
 ## 8. Optional: Dateimanagement-User
-
 Um alle Borg-User-Ordner zentral verwalten zu können (alte Archive löschen, Repos reorganisieren), wird ein Manager-Zugang eingerichtet. Dieser nutzt eine "Restricted Shell" und kann **alle Borg-Repositories modifizieren**, aber nicht auf die schreibgeschützten Snapshots zugreifen.
+
+> ⚠️ **Sicherheitshinweis:** `lshell` ist ein älteres Projekt und hatte in der Vergangenheit Escape-Schwächen. Für maximale Sicherheit empfiehlt es sich, statt einer Shell nur `command="borg serve --restrict-to-path /mnt/borgbackup"` in der `authorized_keys` zu erlauben und Pruning über den Client laufen zu lassen. Falls ein interaktiver Manager zwingend gewünscht ist, geht es hier mit `lshell` weiter:
 
 ### 8.1 lshell installieren und User anlegen
 ```bash
@@ -478,36 +388,15 @@ sudo apt update && sudo apt install lshell
 sudo adduser --shell /usr/bin/lshell manager87654321
 ```
 
-### 8.2 Gruppenrechte und ACLs setzen (Manager mit Schreibzugriff)
-
-Der Manager braucht Schreibzugriff auf **alle** Borg-User-Verzeichnisse. Dies wird mit ACLs gelöst:
+### 8.2 Gruppenrechte setzen (Voraussetzung für Löschungen)
+Da Borg mit `--umask=0007` (aus Schritt 3.2) arbeitet, gehören alle Dateien der Gruppe `borg`. Der Manager muss Mitglied dieser Gruppe sein.
 
 ```bash
-# Manager in die Borg-Gruppe aufnehmen (für Future-Proofing)
+# Manager in die Borg-Gruppe aufnehmen
 sudo usermod -aG borg manager87654321
-
-# ACL-Regel: Der Manager (User) erhält rwx-Rechte auf alle zukünftigen Dateien/Ordner
-sudo setfacl -R -d -m u:manager87654321:rwx /mnt/borgbackup
-
-# Rückwirkend: Manager erhält auch auf bereits existierende Verzeichnisse Zugriff
-sudo setfacl -R -m u:manager87654321:rwx /mnt/borgbackup
 ```
 
-**Was bedeutet das?**
-- `setfacl -R`: Rekursiv (alle Unterverzeichnisse)
-- `-d`: Default-ACL (für zukünftige Dateien/Ordner)
-- `-m`: Modify (ACL hinzufügen, nicht ersetzen)
-- `u:manager87654321:rwx`: User `manager87654321` erhält read, write, execute
-
-**Test, ob Manager schreiben darf:**
-```bash
-# Test als manager
-sudo -u manager87654321 touch /mnt/borgbackup/borg12345678/test-file
-# Sollte funktionieren ✓
-
-sudo -u manager87654321 rm /mnt/borgbackup/borg12345678/test-file
-# Sollte funktionieren ✓
-```
+*(Hinweis: Zusätzliche ACLs via `setfacl` sind nicht mehr zwingend nötig, da die Gruppenzugehörigkeit und das `--umask=0007` bei Borg den Zugriff regeln. Sollten dennoch manuell erstellte Ordner existieren, können diese mit `sudo chmod -R g+w /mnt/borgbackup` für den Manager schreibbar gemacht werden.)*
 
 ### 8.3 SSH-Key für den Manager hinterlegen
 ```bash
@@ -538,19 +427,12 @@ sftp            = 0
 **Wichtig:** Der Manager kann mit diesem Setup:
 - ✅ Alle Borg-Verzeichnisse anschauen (`ls`, `find`, `du`, `stat`)
 - ✅ Neue Borg-User-Verzeichnisse erstellen (`mkdir`)
-- ✅ Alte Archive löschen (`rm -r /mnt/borgbackup/borg12345678/archive-name`)
-- ✅ Leere Verzeichnisse entfernen (`rmdir`)
+- ✅ Alte Archive löschen (`rm -r /mnt/borgbackup/borg12345678/archive-name`) *(Funktioniert nur dank Gruppenzugehörigkeit und Borg --umask!)*
 - ❌ Snapshots NICHT sehen/löschen (liegen unter `/mnt/borg-snapshots`, nicht erreichbar)
 - ❌ Backup-Clients können nicht untereinander auf Repos zugreifen (SSH-Kommando + `--restrict-to-path` erzwingt Isolation)
 
 ### 8.5 SSH-Zugriff & Tunnel-Sperre konfigurieren
-
-In `/etc/ssh/sshd_config`:
-```bash
-sudo nano /etc/ssh/sshd_config
-```
-
-Ergänze die Zeile `AllowUsers`:
+In `/etc/ssh/sshd_config` ergänze die Zeile `AllowUsers`:
 ```text
 AllowUsers adminpi borg12345678 manager87654321
 ```
@@ -568,22 +450,6 @@ SSH neu starten:
 sudo systemctl restart ssh
 ```
 
-**Test:**
-```bash
-# Lokal (über localhost, Port 22):
-ssh -p 22 manager87654321@localhost
-
-# Remote (über Port-Forwarding, Port 50022):
-ssh -p 50022 manager87654321@<dyndns-adresse>
-# Sollte im Terminal-Stammverzeichnis /mnt/borgbackup landen
-
-# Innerhalb lshell: alte Archive löschen
-rm -r /mnt/borgbackup/borg12345678/archive-to-delete
-
-# Oder: Backup-Größe prüfen
-du -sh /mnt/borgbackup/*/
-```
-
 ---
 
 ## Sicherheits-Checkliste vor Produktivnahme
@@ -598,8 +464,7 @@ du -sh /mnt/borgbackup/*/
 - [ ] Generische `borg` Gruppe erstellt
 - [ ] Jeder Borg-User mit `--shell /usr/sbin/nologin` und Home-Verzeichnis
 - [ ] Jeder Borg-User hat Verzeichnis mit `chmod 700`
-- [ ] SSH-Keys mit `command=` und `--restrict-to-path` konfiguriert
-- [ ] ACLs für Manager konfiguriert (falls verwendet)
+- [ ] SSH-Keys mit `command=` und `--restrict-to-path` sowie `--umask=0007` konfiguriert
 
 **SSH & Netzwerk:**
 - [ ] SSH-Härtung (PasswordAuth no, PermitRootLogin no, MaxAuthTries 3)
@@ -611,18 +476,15 @@ du -sh /mnt/borgbackup/*/
 - [ ] Router-Portweiterleitung konfiguriert (Port 50022 → 22)
 
 **Snapshots & Automation:**
-- [ ] Sudoer-Regel für BTRFS erstellt (`/etc/sudoers.d/borg-snapshot`)
 - [ ] Snapshot-Skript erstellt und getestet (10-Tage-Retention)
 - [ ] Snapshot-Skript in root-Crontab eingeplant
 - [ ] Manuelle Snapshot-Erstellung getestet (`sudo /usr/local/bin/borg-snapshot.sh`)
-- [ ] Logfile überprüft (`/var/log/borg-snapshot.log`)
-- [ ] Snapshot-Alter prüfen: `find /mnt/borg-snapshots -name "snap_*" -exec stat -c "%y %n" {} \;`
+- [ ] Logfile überprüfen (`/var/log/borg-snapshot.log`)
 
-**Verwaltung:**
-- [ ] Manager-User optional konfiguriert (oder übersprungen)
-- [ ] ACLs für Manager auf `/mnt/borgbackup` gesetzt
+**Verwaltung (Optional):**
+- [ ] Manager-User konfiguriert und der Gruppe `borg` hinzugefügt
 - [ ] Manager kann Archive löschen (`rm -r`) aber nicht Snapshots ändern
-- [ ] lshell konfiguriert mit korrekten allowed-Befehlen
+- [ ] lshell konfiguriert mit korrekten allowed-Befehlen und `sftp=0`
 
 **Laufend:**
 - [ ] Snapshots regelmäßig prüfen: `sudo btrfs subvolume list /mnt/borg-snapshots`
